@@ -1,0 +1,547 @@
+---
+title: "Analiza opinii książek z platformy Amazon - Projekt Text Mining"
+author: "Maciej Kaszycki"
+output: 
+  html_document:
+    theme: flatly
+    toc: true
+    toc_float: true
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+# Konfiguracja środowiska - ukrywamy ostrzeżenia i techniczne wiadomości pakietów
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+
+# Wczytanie niezbędnych bibliotek
+library(textdata)
+library(tidyverse)    
+library(tidytext)     
+library(tm)           
+library(textstem) 
+library(wordcloud)
+library(wordcloud2)   
+library(topicmodels) 
+library(plotrix)
+library(igraph)
+library(ggraph)
+library(widyr)
+```
+
+## 1. Wprowadzenie i przygotowanie danych
+
+Poniższy projekt opiera się na analizie próby 50 000 recenzji książek pochodzących z platformy Amazon. W pierwszej sekcji zbiór danych został przygotowany do dalszej pracy analitycznej. Proces rozpoczęto od wczytania danych oraz odfiltrowania braków i pustych wierszy, co pozwala zapobiec błędom w modelowaniu na kolejnych etapach. Następnie format czasu systemowego przekonwertowano na czytelne, standardowe daty. Na koniec, opierając się na wystawionych ocenach gwiazdkowych, do każdej recenzji przypisano etykietę sentymentu (pozytywna, neutralna lub negatywna).
+
+```{r data_prep}
+
+setwd("C:/Users/elaka/OneDrive/CDV/Text Mining/Projekt R")
+
+df_raw <- read.csv("Books_rating.csv",
+                   nrows = 50000,
+                   stringsAsFactors = FALSE,
+                   encoding = "UTF-8")
+
+# Wybranie kolumn, zmiana nazw i czyszczenie braków
+df <- df_raw %>%
+  select(
+    id        = Id,
+    title     = Title,
+    score     = review.score,
+    time      = review.time,
+    summary   = review.summary,
+    text      = review.text
+  ) %>%
+  filter(!is.na(text), !is.na(score)) %>%
+  filter(text != "", score != "")
+
+# Konwersja czasu
+df$data <- as.Date(as.POSIXct(as.numeric(df$time), origin = "1970-01-01"))
+df$year <- format(df$date, "%Y")
+
+# Nadanie etykiet sentymentu
+df <- df %>%
+  mutate(sentiment_label = case_when(
+    score <= 2 ~ "negatywna",
+    score == 3 ~ "neutralna",
+    score >= 4 ~ "pozytywna"
+  ))
+```
+
+## 2. Czyszczenie tekstu i tokenizacja
+
+W celu zapewnienia prawidłowego działania modeli analitycznych, surowy tekst poddano procesowi standaryzacji. Zbudowany korpus został oczyszczony ze zbędnych elementów: znaków interpunkcyjnych, liczb oraz powszechnie używanych słów niewnoszących istotnego znaczenia (tzw. stopwords). Następnie wykonano lematyzację, która sprowadza wyrazy do ich formy podstawowej, zapobiegając traktowaniu różnych odmian tego samego słowa jako osobnych bytów. Ostatnim etapem była tokenizacja, czyli podział oczyszczonego tekstu na pojedyncze słowa, połączona z odfiltrowaniem najkrótszych, przypadkowych ciągów znaków.
+
+```{r cleaning}
+# Budowa i czyszczenie korpusu
+corpus <- VCorpus(VectorSource(df$text))
+
+corpus <- tm_map(corpus, content_transformer(tolower))
+corpus <- tm_map(corpus, removeNumbers)
+corpus <- tm_map(corpus, removeWords, tm::stopwords("en"))
+corpus <- tm_map(corpus, removePunctuation)
+corpus <- tm_map(corpus, stripWhitespace)
+
+# Lematyzacja
+corpus <- tm_map(corpus, content_transformer(lemmatize_strings))
+
+df$text_clean <- sapply(corpus, function(x) x$content) 
+
+# Tokenizacja i filtracja krótkich znaków
+word_tokens <- df %>%
+  unnest_tokens(word, text_clean) %>%
+  filter(!str_detect(word, "\\d")) %>%   
+  filter(nchar(word) > 2) 
+```
+
+## 3. Analiza częstości słów
+
+W kolejnym etapie projektu przeprowadzono analizę częstości występowania poszczególnych pojęć w oczyszczonym korpusie tekstowym. Przygotowane wizualizacje obrazują rozkład najpopularniejszych słów w trzech wariantach: ogólnym, z uwzględnieniem podziału na sentyment (pozytywny i negatywny) oraz w ujęciu historycznym. Takie zestawienie pozwala na błyskawiczną identyfikację głównych tematów poruszanych przez recenzentów. Umożliwia również zaobserwowanie, które z pojęć najsilniej korelują z wysoką lub niską oceną książki oraz w jaki sposób zmieniały się trendy i preferencje czytelników na przestrzeni badanych lat.
+
+```{r frequency_plot_top30, fig.width=10, fig.height=8}
+word_count <- word_tokens %>% count(word, sort = TRUE)
+
+# Wykres 30 najpopularniejszych słów ogółem
+word_top30 <- word_count %>%
+  top_n(30, n) %>%
+  mutate(word = reorder(word, n))
+
+plot_top30 <- ggplot(word_top30, aes(x = word, y = n)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  geom_text(aes(label = n), hjust = 1.2, color = "white", size = 3) +
+  theme_minimal() +
+  labs(title = "30 najczęściej występujących słów", x = NULL, y = "Liczba wystąpień")
+print(plot_top30)
+```
+
+**Wnioski z analizy najpopularniejszych słów:**
+
+Powyższy wykres ukazuje naturalną dominację słów związanych z samym czytelnictwem („book”, „read”). Wysoka pozycja pojęć takich jak „good”, „great” czy „love” od razu wskazuje na asymetrię zbioru i wyraźną przewagę opinii pozytywnych na platformie. Z kolei częsta obecność słów typu „story”, „character” i „world” dowodzi, że klienci oceniają książki przede wszystkim przez pryzmat fabuły, bohaterów i wykreowanego świata, znacznie rzadziej skupiając się na technicznych aspektach wydania czy stylu autora.
+
+```{r frequency_plot_sentiment, fig.width=10, fig.height=8}
+# Wykres z podziałem na sentyment pozytywny i negatywny
+word_by_sentiment <- word_tokens %>%
+  filter(sentiment_label %in% c("pozytywna", "negatywna")) %>%
+  count(sentiment_label, word, sort = TRUE) %>%
+  group_by(sentiment_label) %>%
+  top_n(20, n) %>%
+  ungroup() %>%
+  mutate(word = reorder_within(word, n, sentiment_label))
+
+plot_sent_freq <- ggplot(word_by_sentiment, aes(x = word, y = n, fill = sentiment_label)) +
+  geom_col(show.legend = FALSE) +
+  coord_flip() +
+  facet_wrap(~ sentiment_label, scales = "free_y") +
+  scale_x_reordered() +
+  scale_fill_manual(values = c("negatywna" = "tomato", "pozytywna" = "steelblue")) +
+  theme_minimal() +
+  labs(title = "Najczęstsze słowa w opiniach pozytywnych i negatywnych", x = NULL, y = "Liczba wystąpień")
+print(plot_sent_freq)
+```
+
+**Wnioski z analizy słów w podziale na sentyment:**
+
+Powyższy wykres dobitnie potwierdza asymetrię badanego zbioru danych – ogromna różnica w sumarycznej liczbie wystąpień słów na osi X wskazuje na przytłaczającą przewagę opinii pozytywnych. Choć szczyty obu zestawień zajmują te same neutralne określenia związane z czytelnictwem („book”, „read”), kluczowe różnice uwidaczniają się na niższych pozycjach. Pozytywne recenzje naturalnie wyróżniają się obecnością słów o silnym ładunku emocjonalnym („great”, „love”) oraz pojęć ogólnych („life”, „world”). Z kolei w opiniach negatywnych brakuje jednoznacznie pejoratywnych wyrazów (wysoko znajduje się tu nawet słowo „good”, najprawdopodobniej używane w formie zaprzeczenia). Sugeruje to, że czytelnicy na platformie Amazon wyrażają krytykę w sposób bardziej zniuansowany i opisowy, kierując ją w stronę konkretnych elementów dzieła, takich jak kreacja postaci („character”) czy praca twórcy („author”).
+
+```{r frequency_plot_time, fig.width=10, fig.height=8}
+# Analiza w czasie dla wybranych słów kluczowych
+slowa_kluczowe <- word_tokens %>%
+  count(year, word, sort = TRUE) %>%
+  complete(year, word, fill = list(n = 0)) %>%
+  group_by(year) %>%
+  mutate(total = sum(n)) %>%
+  filter(word %in% c("story", "character", "love", "boring", "author", "plot")) %>%
+  ungroup()
+
+plot_time <- ggplot(slowa_kluczowe, aes(x = year, y = n / total, color = word, group = word)) +
+  geom_line(size = 1) +
+  geom_point() +
+  theme_minimal() +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 0.01)) +
+  labs(title = "Częstość kluczowych słów w czasie", x = "Rok", y = "% wystąpień w danym roku", color = "Słowo") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+print(plot_time)
+```
+
+**Wnioski z analizy częstości słów w czasie:**
+
+Powyższy wykres ujawnia interesującą anomalię statystyczną na początku osi czasu (lata 1995-1996), gdzie skrajne wahania udziału poszczególnych słów – w tym nagły pik dla „story” oraz zerowe wartości dla innych pojęć – wynikają z problemu małej próby, czyli znikomej liczby recenzji w pierwszych latach działalności platformy. Wraz ze wzrostem wolumenu danych po 1997 roku, trendy stabilizują się zgodnie z prawem wielkich liczb. Analiza ustabilizowanego okresu dowodzi, że dla recenzentów niezmiennie najważniejsza pozostaje warstwa fabularna, co widać po trwałej dominacji słowa „story”. Jednocześnie zauważalny jest wyraźny, systematyczny wzrost częstotliwości występowania słowa „love” od około 2009 roku, co może sugerować stopniową zmianę języka opinii internetowych na bardziej emocjonalny i ekspresyjny.
+
+## 4. Reprezentacje wizualne: Chmury i Piramida Słów
+
+W celu głębszego zbadania relacji między używanym słownictwem a ostateczną oceną produktu, wygenerowano reprezentacje wizualne w postaci trzech wariantów chmur słów. Umożliwiają one intuicyjne zaobserwowanie, które pojęcia najsilniej korelują z zadowoleniem, a które z negatywnym nastawieniem recenzentów. Analizę tę uzupełniono o wykres piramidowy, służący do precyzyjnego pomiaru i zestawienia słów wspólnych dla obu biegunów sentymentu. Zastosowanie tych metod pozwala na przejrzyste zobrazowanie stopnia polaryzacji opinii oraz wyodrębnienie kluczowych różnic w języku stosowanym przez klientów.
+
+```{r cloud_general, fig.width=8, fig.height=8}
+# 1. Chmura ogólna
+par(mar = c(0, 0, 0, 0))
+wordcloud(words = word_count$word, freq = word_count$n, max.words = 100,
+          rot.per = 0.35, colors = brewer.pal(8, "Dark2"), random.order = FALSE)
+```
+
+**Wnioski z analizy chmury ogólnej:**
+
+Ogólna chmura słów obrazuje główne osie tematyczne całego zbioru recenzji. Zdecydowana dominacja wyrazów „book” i „read” stanowi naturalne odzwierciedlenie analizowanego przedmiotu. Widoczne wyeksponowanie słów takich jak „story”, „character” czy „novel” podkreśla silne skupienie czytelników na warstwie fabularnej ocenianych dzieł. Ponadto, wyraźna obecność pozytywnych określeń wartościujących, zwłaszcza „good” i „great”, już na tym etapie potwierdza ogólny, przychylny wydźwięk większości zgromadzonych opinii.
+
+```{r cloud_comparison, fig.width=8, fig.height=8}
+# Przygotowanie macierzy porównawczej
+pos_text <- word_tokens %>% filter(sentiment_label == "pozytywna") %>% pull(word) %>% paste(collapse = " ")
+neg_text <- word_tokens %>% filter(sentiment_label == "negatywna") %>% pull(word) %>% paste(collapse = " ")
+
+corpus_comp <- VCorpus(VectorSource(c(pos_text, neg_text)))
+tdm_comp <- TermDocumentMatrix(corpus_comp, control = list(weighting = weightTf, removePunctuation = TRUE, stopwords = TRUE))
+tdm_comp_m <- as.matrix(tdm_comp)
+colnames(tdm_comp_m) <- c("pozytywna", "negatywna")
+
+# 2. Chmura porównawcza
+par(mar = c(0, 0, 1, 0))
+comparison.cloud(tdm_comp_m, max.words = 100, random.order = FALSE, title.size = 1.2, colors = c("steelblue", "tomato"))
+```
+
+**Wnioski z analizy chmury porównawczej:**
+
+Chmura porównawcza ukazuje wyraźny kontrast w doborze słownictwa w zależności od sentymentu recenzji. W opiniach pozytywnych dominują wyrażenia silnie afirmatywne i abstrakcyjne (m.in. „great”, „love”, „world”, „life”), co wskazuje na głębokie, emocjonalne zaangażowanie czytelników w wykreowane uniwersum oraz chęć polecania dzieła innym („recommend”). Z kolei recenzje negatywne charakteryzują się językiem dosadnym i zorientowanym na pragmatykę konsumencką. Widoczne nagromadzenie pojęć takich jak „bad”, „bore”, „waste”, „money” czy „disappoint” jednoznacznie odzwierciedla poczucie straty czasu i środków, natomiast częste przywoływanie słów „author” i „page” sugeruje bezpośrednią krytykę warsztatu pisarskiego oraz samej konstrukcji technicznej książki.
+
+```{r cloud_commonality, fig.width=8, fig.height=8}
+# 3. Chmura części wspólnej
+commonality.cloud(tdm_comp_m, max.words = 100, random.order = FALSE, colors = brewer.pal(6, "Greens"))
+```
+
+**Wnioski z analizy chmury części wspólnej:**
+
+Chmura części wspólnej prezentuje pojęcia używane z wysoką częstotliwością w obu grupach sentymentu, stanowiąc uniwersalny fundament językowy recenzji na platformie. W centrum niezmiennie dominują neutralne określenia przedmiotu i czynności („book”, „read”). Współdzielenie słów takich jak „story”, „character” czy „write” dowodzi, że niezależnie od ostatecznej oceny, zarówno entuzjaści, jak i krytycy budują swoją argumentację wokół tych samych, bazowych elementów rzemiosła literackiego. Zauważalna obecność wyrazów o naturalnie pozytywnym nacechowaniu („good”, „like”) w zbiorze wspólnym wynika najprawdopodobniej z faktu, że w opiniach negatywnych są one powszechnie stosowane w konstrukcjach przeczących (np. „not good”) lub służą do opisu zawiedzionych oczekiwań („wanted to like”).
+
+### Wykres Piramidowy
+
+```{r pyramid_plot, fig.width=8, fig.height=8}
+# Czyszczenie NA i szukanie części wspólnych
+tdm_comp_m[is.na(tdm_comp_m)] <- 0
+common_terms <- tdm_comp_m[tdm_comp_m[, 1] > 0 & tdm_comp_m[, 2] > 0, ]
+
+diff_terms <- abs(common_terms[, 1] - common_terms[, 2])
+common_terms <- cbind(common_terms, diff_terms)
+common_terms <- common_terms[order(common_terms[, 3], decreasing = TRUE), ]
+
+df_pyramid <- data.frame(
+  pozytywne = common_terms[1:25, 1], 
+  negatywne = common_terms[1:25, 2],
+  labels = rownames(common_terms)[1:25]
+)
+
+colours_pos <- colorRampPalette(brewer.pal(9, "Blues"))(25)
+colours_neg <- colorRampPalette(brewer.pal(9, "Reds"))(25)
+
+par(mfrow = c(1,1), mar = c(0, 0, 0, 0))
+pyramid.plot(df_pyramid$pozytywne, df_pyramid$negatywne, 
+             labels = df_pyramid$labels,
+             gap = 3500,  
+             top.labels = c("Pozytywne", "Słowa", "Negatywne"),
+             main = "Piramida najczęstszych wspólnych słów", 
+             lxcol = colours_pos, rxcol = colours_neg,
+             laxlab = NULL, raxlab = NULL, unit = NULL)
+```
+
+**Wnioski z analizy wykresu piramidowego:**
+
+Wykres piramidowy dobitnie obrazuje skalę asymetrii w badanym zbiorze recenzji. Pomimo zestawienia pojęć współdzielonych przez oba bieguny sentymentu, wolumen wystąpień po stronie opinii pozytywnych (lewa oś) przytłaczająco przewyższa częstotliwość ich użycia w tekstach negatywnych (prawa oś). Obecność w tej części wspólnej słów o silnym nacechowaniu afirmatywnym, takich jak „great”, „love” czy „good”, w kontekście ocen negatywnych ostatecznie potwierdza wcześniejszą hipotezę – niezadowoleni czytelnicy rzadko używają agresywnego języka, a swoją krytykę budują raczej na zaprzeczeniach (np. „not great”) i opisywaniu niespełnionego potencjału danego dzieła.
+
+## 5. Związki między słowami 
+
+W niniejszej sekcji przeprowadzono analizę asocjacji słów, mającą na celu odkrycie relacji kontekstowych wewnątrz recenzji.  Wyznaczono i zwizualizowano korelacje dla dwóch wyrazów o odmiennym ładunku emocjonalnym: neutralnego „story” oraz nacechowanego negatywnie „disappoint”. Pozwala to zrozumieć, w jakim otoczeniu językowym najczęściej pojawiają się te pojęcia. Dopełnieniem tej części jest ekstrakcja bigramów oraz budowa wykresu sieciowego, co umożliwia zmapowanie najczęstszych struktur logicznych i powiązań wyrazowych stosowanych przez czytelników.
+
+```{r assoc_story, fig.width=10, fig.height=5}
+dtm_assoc <- word_tokens %>%
+  count(id, word, sort = TRUE) %>%
+  cast_dtm(id, word, n)
+
+# Asocjacje dla "story"
+assoc_story <- findAssocs(dtm_assoc, "story", 0.3)
+assoc_story <- as.data.frame(assoc_story)
+assoc_story$terms <- factor(row.names(assoc_story), levels = row.names(assoc_story))
+assoc_story <- head(assoc_story, 20)
+
+plot_assoc1 <- ggplot(data = assoc_story, aes(y = terms, x = story)) +
+  geom_point(size = 3, color = "steelblue") +
+  geom_text(aes(label = round(story, 2)), color = "darkblue", vjust = -0.6, size = 3) +
+  theme_minimal() +
+  scale_x_reverse() +
+  labs(title = "Słowa powiązane z 'story'", x = "Współczynnik asocjacji", y = NULL)
+print(plot_assoc1)
+```
+
+**Wnioski z analizy asocjacji dla słowa „story”:**
+
+Wykres ujawnia najsilniejszy związek słowa „story” z pojęciami „character” (współczynnik 0.95) oraz „plot” (0.94), co bezpośrednio odzwierciedla naturalną strukturę opinii literackich, w których fabuła i losy bohaterów omawiane są zazwyczaj nierozłącznie. Wyraźna obecność przymiotników o zabarwieniu afirmatywnym, takich jak „great”, „good” czy „fantastic”, dowodzi dodatkowo, że pojęcie to występuje w recenzjach najczęściej w kontekście pozytywnym, służąc czytelnikom do bezpośredniej pochwały jakości i spójności ocenianej narracji.
+
+```{r assoc_disappoint, fig.width=10, fig.height=5}
+# Asocjacje dla "disappoint"
+assoc_bad <- findAssocs(dtm_assoc, "disappoint", 0.4)
+assoc_bad <- as.data.frame(assoc_bad)
+assoc_bad$terms <- factor(row.names(assoc_bad), levels = row.names(assoc_bad))
+assoc_bad <- head(assoc_bad, 20)
+
+plot_assoc2 <- ggplot(data = assoc_bad, aes(y = terms, x = disappoint)) +
+  geom_point(size = 3, color = "tomato") +
+  geom_text(aes(label = round(disappoint, 2)), color = "darkred", vjust = -0.6, size = 3) +
+  theme_minimal() +
+  scale_x_reverse() +
+  labs(title = "Słowa powiązane z 'disappoint'", x = "Współczynnik asocjacji", y = NULL)
+print(plot_assoc2)
+```
+
+**Wnioski z analizy asocjacji dla słowa „disappoint”:**
+
+Wykres asocjacji dla pojęcia „disappoint” ujawnia bardzo ciekawe zjawisko lingwistyczne. Z jednej strony, najwyższe powiązania ze słowami takimi jak „expect”, „finish”, „story” oraz „character” (współczynnik 0.85) wyraźnie wskazują, że źródłem recenzenckiego rozczarowania są najczęściej niespełnione oczekiwania względem finału powieści i ogólnego poprowadzenia fabuły. Z drugiej strony, na wykresie pojawiają się słowa o ładunku wybitnie pozytywnym, takie jak „good” czy „great”. Stanowi to klasyczny przykład tzw. zjawiska kontrastu – czytelnicy używają tych określeń do zarysowania utraconego potencjału dzieła, wskazując na przykład, że książka miała świetny pomysł wyjściowy, ale ostatecznie ich zawiodła.
+
+### Bigramy i Wykres Sieciowy
+
+Aby zrozumieć kontekst wyrażeń, podzielono tekst na Bigramy.
+
+```{r network, fig.width=10, fig.height=8}
+bigrams <- df %>%
+  unnest_tokens(bigram, text_clean, token = "ngrams", n = 2) %>%
+  separate(bigram, c("word1", "word2"), sep = " ") %>%
+  filter(!is.na(word1), !is.na(word2)) %>%
+  filter(nchar(word1) > 2, nchar(word2) > 2)
+
+# Analiza sieci (Network Graph)
+bigrams %>%
+  count(word1, word2, sort = TRUE) %>%
+  filter(n >= 250) %>%  
+  graph_from_data_frame() %>%
+  ggraph(layout = "fr") +
+  geom_edge_link(aes(edge_alpha = n), show.legend = FALSE,
+                 arrow = arrow(type = "closed", length = unit(3, "mm"))) +
+  geom_node_point(color = "steelblue", size = 4) +
+  geom_node_text(aes(label = name), vjust = 1.5, size = 3) +
+  theme_void() +
+  labs(title = "Sieć powiązań między słowami (Bigramy)")
+```
+
+**Wnioski z analizy sieci powiązań:**
+
+Wykres sieciowy ujawnia podwójną naturę języka stosowanego w recenzjach. Z jednej strony obserwujemy potężny, centralny klaster skupiony wokół słowa „book”, od którego odchodzą uniwersalne określenia wartościujące (np. „great book”) oraz zwroty rekomendacyjne i analityczne (np. połączenie „highly” z „recommend” czy klastry wokół „read”). Z drugiej strony, na peryferiach sieci wyłaniają się izolowane, lecz bardzo silne powiązania specyficzne dla konkretnych dzieł literackich. Pary takie jak „george” – „orwell”, „winston” – „smith”, „ray” – „bradbury”, „guy” – „montag” czy „hari” – „seldon” i „galactic” – „empire” jednoznacznie wskazują, że w badanej próbie danych wyraźnie dominują recenzje klasycznych powieści dystopijnych i fantastycznonaukowych (co bezpośrednio potwierdza również silny bigram „science” – „fiction”). Udowadnia to, że analiza bigramów pozwala nie tylko badać ogólny sentyment i strukturę zdań, ale także skutecznie identyfikować konkretne, najczęściej omawiane tytuły bez konieczności zagłębiania się w pełną treść opinii.
+
+
+## 6. Nienadzorowane Uczenie Maszynowe
+
+W tej sekcji wykorzystano techniki nienadzorowanego uczenia maszynowego do głębszej eksploracji korpusu tekstowego. Przeprowadzono analizę sentymentu przy użyciu leksykonów Bing oraz NRC, co pozwoliło na ilościowe określenie ładunku emocjonalnego opinii oraz zbadanie jego bezpośredniej korelacji z wystawioną oceną produktu. Następnie zaimplementowano algorytm modelowania tematycznego LDA i zastosowano binarną reprezentację macierzy DTM, aby automatycznie wyodrębnić ukryte wątki poruszane przez czytelników. Ostatnim etapem była klasteryzacja hierarchiczna, która na podstawie wag TF-IDF pogrupowała najistotniejsze słowa w klastry, ujawniając naturalne, wielowymiarowe struktury wewnątrz badanych danych.
+
+### 6.1. Analiza Sentymentu
+
+```{r sentiment_time, fig.width=10, fig.height=6}
+bing <- get_sentiments("bing")
+
+# Sentyment Bing w czasie
+sent_time <- word_tokens %>%
+  inner_join(bing, by = "word", relationship = "many-to-many") %>%
+  count(year, sentiment) %>%
+  spread(sentiment, n) %>%
+  mutate(diff = positive - negative, year = as.integer(year))
+
+ggplot(sent_time, aes(x = year)) +
+  geom_line(aes(y = positive), color = "steelblue", linewidth = 1.2) +
+  geom_line(aes(y = negative), color = "tomato", linewidth = 1.2) +
+  theme_minimal() +
+  labs(title = "Słowa pozytywne i negatywne w czasie (BING)", x = "Rok", y = "Liczba słów")
+```
+
+**Wnioski z analizy sentymentu w czasie (leksykon BING):**
+
+Wykres ilustrujący zmienność nacechowania emocjonalnego na przestrzeni lat ujawnia niemal identyczny przebieg obu krzywych. Zbieżność ta dowodzi, że widoczne fluktuacje (w tym gwałtowny spadek na samym końcu osi, będący najprawdopodobniej efektem niepełnych danych dla ostatniego badanego roku) są wyłącznie odzwierciedleniem zmian w całkowitym wolumenie dodawanych recenzji na platformie, a nie historycznych zmian w nastrojach czytelników. Kluczową obserwacją z perspektywy analitycznej jest fakt, że linia reprezentująca słowa pozytywne przez cały badany okres konsekwentnie utrzymuje się wyraźnie powyżej linii słów negatywnych, cementując tym samym tezę o trwałej, niezachwianej w czasie dominacji opinii przychylnych.
+
+```{r sentiment_score, fig.width=10, fig.height=6}
+# Sentyment vs Ocena Produktu
+word_tokens %>%
+  inner_join(bing, by = "word", relationship = "many-to-many") %>%
+  count(id, score, sentiment) %>%
+  spread(sentiment, n, fill = 0) %>%
+  mutate(sent_score = positive - negative) %>%
+  group_by(score) %>%
+  summarise(mean_sent = mean(sent_score)) %>%
+  ggplot(aes(x = factor(score), y = mean_sent, fill = factor(score))) +
+  geom_col(show.legend = FALSE) +
+  scale_fill_brewer(palette = "RdYlGn") +
+  theme_minimal() +
+  labs(title = "Średni wynik sentymentu vs ocena gwiazdkowa", x = "Ocena (gwiazdki)", y = "Średni wynik sentymentu")
+```
+
+**Wnioski z korelacji sentymentu z oceną:**
+
+Wykres w sposób jednoznaczny udowadnia silną, wprost proporcjonalną korelację między przyznaną oceną gwiazdkową a średnim wynikiem sentymentu obliczonym dla treści recenzji. Oceny skrajnie niskie (1 gwiazdka) odznaczają się głęboko negatywnym nacechowaniem emocjonalnym, z kolei opinie pięciogwiazdkowe generują drastyczny skok wskaźnika pozytywnego. Warto zwrócić uwagę na recenzje dwugwiazdkowe, których średni sentyment oscyluje tuż poniżej zera – sugeruje to, że użytkownicy wystawiający tę notę stosują zazwyczaj bardziej wyważoną, stonowaną krytykę, unikając skrajnego słownictwa. Płynny, schodkowy wzrost wartości na wykresie dowodzi, że zastosowany model analizy leksykalnej niezwykle trafnie odzwierciedla rzeczywiste intencje i poziom zadowolenia czytelników na platformie.
+
+```{r sentiment_nrc, fig.width=10, fig.height=6}
+# Profil emocjonalny NRC
+nrc <- get_sentiments("nrc")
+
+word_tokens %>%
+  inner_join(nrc %>% filter(!sentiment %in% c("positive", "negative")),
+             by = "word", relationship = "many-to-many") %>%
+  count(sentiment, sort = TRUE) %>%
+  mutate(sentiment = reorder(sentiment, n)) %>%
+  ggplot(aes(x = sentiment, y = n, fill = sentiment)) +
+  geom_col(show.legend = FALSE) +
+  coord_flip() +
+  theme_minimal() +
+  labs(title = "Emocje w opiniach o książkach (Leksykon NRC)", x = NULL, y = "Liczba wystąpień")
+```
+
+**Wnioski z analizy profilu emocjonalnego (Leksykon NRC):**
+
+Wykres dostarcza fascynujących wniosków na temat specyfiki doświadczeń czytelniczych, potwierdzając wyraźną dominację emocji afirmatywnych: zaufania („trust”), oczekiwania („anticipation”) oraz radości („joy”). Taki układ doskonale koresponduje z udowodnioną już ogólną, pozytywną asymetrią badanego zbioru recenzji. Niezwykle interesująca z perspektywy analitycznej jest wysoka, czwarta pozycja strachu („fear”). W kontekście recenzji literackich częsta obecność słów powiązanych z tą emocją najprawdopodobniej nie wynika z negatywnego stosunku do samej książki, lecz z silnej reprezentacji gatunków takich jak dystopia, fantastyka naukowa czy thriller (co zresztą potwierdziła wcześniejsza analiza sieci bigramów), w których budowanie napięcia i poczucia zagrożenia stanowi wysoce pożądany, angażujący element fabuły. Zgodnie z przewidywaniami, na samym dole zestawienia znalazły się emocje skrajnie negatywne i odrzucające względem produktu, takie jak gniew („anger”) i wstręt („disgust”).
+
+### 6.2. Binarna reprezentacja DTM
+
+W tej podsekcji zaimplementowano alternatywną, binarną reprezentację korpusu tekstowego za pomocą macierzy DTM (z wykorzystaniem wagi weightBin). W odróżnieniu od klasycznych metod częstotliwościowych, podejście to nie zlicza wielokrotnych wystąpień danego słowa w pojedynczym dokumencie. Zamiast tego algorytm rejestruje wyłącznie sam fakt zaistnienia pojęcia w recenzji, przypisując mu wartość 1 (obecne) lub 0 (nieobecne). Taki zabieg standaryzacyjny jest szczególnie użyteczny w modelowaniu analitycznym, gdzie samo użycie konkretnego wyrazu niesie większą wartość informacyjną i klasyfikacyjną niż liczba jego powtórzeń.
+
+```{r binary_dtm}
+dtm_binary <- DocumentTermMatrix(corpus,
+                                 control = list(
+                                   weighting = weightBin 
+                                 ))
+
+# Podgląd fragmentu macierzy binarnej dla popularnych słów
+inspect(dtm_binary[1:5, c("book", "read", "story", "like")])
+```
+
+**Wnioski z zastosowania binarnej reprezentacji DTM:**
+
+Powyższy podgląd macierzy potwierdza poprawną transformację korpusu. Zgodnie z założeniami wag binarnych, algorytm zignorował częstotliwość występowania słów wewnątrz pojedynczej recenzji, rejestrując wyłącznie fakt ich obecności (wartość 1) lub braku (wartość 0). Przykładowo, w dokumencie numer 2 odnotowano użycie pojęć „book”, „like” oraz „read”, redukując ewentualne wielokrotne powtórzenia do pojedynczego sygnału. Takie ustandaryzowanie danych (przy widocznej rzadkości macierzy na poziomie 40%) skutecznie niweluje zjawisko sztucznego zawyżania wagi słów przez nadmiernie wylewnych recenzentów, tworząc wysoce zoptymalizowane i wolne od szumu środowisko wejściowe dla algorytmów klasyfikacyjnych i uczących.
+
+### 6.3. Modelowanie Tematyczne (LDA)
+
+W tej podsekcji zastosowano algorytm LDA (Latent Dirichlet Allocation) do automatycznej kategoryzacji tekstów. Wykorzystując podejście nienadzorowanego uczenia maszynowego, modelowi zlecono wyodrębnienie czterech ukrytych tematów, bazując wyłącznie na strukturze współwystępowania wyrazów w recenzjach. Podejście to pozwoliło wyznaczyć prawdopodobieństwo przynależności konkretnych słów do danego tematu (współczynnik beta) oraz przypisać całe dokumenty do odkrytych wątków tematycznych (współczynnik gamma).
+
+```{r lda, fig.width=10, fig.height=6}
+dtm_lda <- word_tokens %>%
+  count(id, word, sort = TRUE) %>%
+  cast_dtm(id, word, n)
+
+dtm_lda <- dtm_lda[rowSums(as.matrix(dtm_lda)) > 0, ]
+
+set.seed(1234)
+lda_model <- LDA(dtm_lda, k = 4, control = list(seed = 1234))
+lda_topics <- tidy(lda_model, matrix = "beta")
+
+# Prawdopodobieństwo przypisania słowa do tematu (Beta)
+lda_topics %>%
+  group_by(topic) %>%
+  top_n(15, beta) %>%
+  ungroup() %>%
+  mutate(term = reorder_within(term, beta, topic)) %>%
+  ggplot(aes(term, beta, fill = factor(topic))) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~ topic, scales = "free") +
+  coord_flip() +
+  scale_x_reordered() +
+  theme_minimal() +
+  labs(title = "Najważniejsze słowa dla każdego tematu (LDA)", x = NULL, y = "Prawdopodobieństwo (beta)")
+```
+
+**Wnioski z modelowania tematycznego (LDA):**
+
+Analiza wyodrębnionych tematów ukazuje specyfikę badanego korpusu, w którym we wszystkich czterech grupach naturalnie dominują uniwersalne pojęcia „book” i „read”. Mimo tego silnego wspólnego mianownika algorytm zdołał zidentyfikować istotne różnice kontekstowe. Temat pierwszy („novel”, „world”) oraz trzeci („character”, „series”, „foundation”) ewidentnie grupują recenzje beletrystyki, ze szczególnym uwzględnieniem wielotomowych cykli fantastycznonaukowych, co ponownie potwierdza obecność klasyków gatunku w badanej próbie. Z kolei temat drugi, akcentujący słowa „life” i „people”, zdaje się agregować opinie dotyczące biografii lub literatury faktu skupionej na ludzkich doświadczeniach. Temat czwarty, wyróżniający się czasownikami użytkowymi takimi jak „work”, „use” czy „make”, sugeruje skuteczne wyodrębnienie przez model klastra poradników i literatury specjalistycznej, ocenianej przez czytelników głównie przez pryzmat jej praktycznego zastosowania.
+
+```{r lda_gamma, fig.width=10, fig.height=6}
+# Przypisanie całych dokumentów do tematów (Gamma)
+lda_gamma <- tidy(lda_model, matrix = "gamma")
+
+lda_gamma %>%
+  group_by(document) %>%
+  top_n(1, gamma) %>%
+  ungroup() %>%
+  count(topic) %>%
+  ggplot(aes(x = factor(topic), y = n, fill = factor(topic))) +
+  geom_col(show.legend = FALSE) +
+  theme_minimal() +
+  labs(title = "Liczba opinii przypisanych do każdego tematu", x = "Temat", y = "Liczba opinii")
+```
+
+**Wnioski z przypisania dokumentów do tematów:**
+
+Powyższy wykres przedstawia ilościowy rozkład recenzji przypisanych do poszczególnych tematów na podstawie najwyższego prawdopodobieństwa. Zestawienie ujawnia silną asymetrię korpusu – zdecydowanie dominuje w nim temat czwarty, do którego algorytm zaklasyfikował ponad dwukrotnie więcej opinii niż do kolejnego w zestawieniu tematu drugiego. Tak znaczna dysproporcja i jednoczesna marginalizacja tematu pierwszego mogą sugerować, że kategoria czwarta (związana wcześniej ze słownictwem użytkowym i praktycznym) pełni w wyuczonym modelu funkcję obszaru ogólnego, do którego trafia większość tekstów o mniej specyficznej, ustandaryzowanej treści. Zjawisko to dobitnie świadczy o niejednorodności tematycznej badanej próby danych i wyraźnej przewadze jednego, szerokiego wątku nad pozostałymi.
+
+### 6.4. Klasteryzacja Hierarchiczna (Odległość TF-IDF)
+
+Ostatnim etapem jest klasteryzacja hierarchiczna, pozwalająca wizualnie przedstawić drzewo połączeń (dendrogram) na podstawie wagi TF-IDF słów w dokumentach.
+
+```{r clustering, fig.width=10, fig.height=8}
+# --- PAKIETY ---
+# install.packages(c("dendextend", "tm"))  
+library(tm)
+library(dendextend)
+
+# --- 1. PRZYGOTOWANIE MACIERZY ---
+# dtm_tfidf <- DocumentTermMatrix(corpus,
+#                control = list(weighting = weightTfIdf))
+
+
+m <- as.matrix(dtm_tfidf)
+freq <- colSums(a# częstości surowe
+top_words <- names(sort(freq, decreasing = TRUE))[1:30]
+
+
+top_words <- setdiff(top_words, c("book", "read"))
+
+m <- m[, top_words]
+
+# --- 2. ODLEGŁOŚCI I KLASTERYZACJA ---
+=
+
+
+odleglosci <- dist(t(m))
+hc <- hclust(odleglosci, method = "ward.D2")  
+
+
+dend <- as.dendrogram(hc)
+dend <- color_branches(dend, k = 4)          # pokoloruj 4 grupy 
+dend <- color_labels(dend, k = 4)            # te same kolory dla etykiet
+dend <- set(dend, "labels_cex", 0.85)        # wielkość napisów
+dend <- set(dend, "branches_lwd", 2)         # grubsze gałęzie
+
+# --- 4. RYSOWANIE (POZIOMO = czytelne etykiety) ---
+par(mar = c(4, 2, 3, 9))                     # duży margines z prawej na słowa
+plot(dend, horiz = TRUE,
+     main = "Klasteryzacja hierarchiczna słów",
+     xlab = "Odległość")
+```
+
+**Wnioski z klasteryzacji hierarchicznej (Dendrogram):**
+
+Powyższy dendrogram, oparty na wagach TF-IDF, ukazuje pięć zdefiniowanych skupisk pojęciowych. Zdecydowana większość uniwersalnego słownictwa (m.in. „book”, „read”, „good”, „time”) została zagregowana w jednym, potężnym klastrze centralnym, stanowiącym językowy fundament typowej recenzji. Szczególną uwagę zwracają wyizolowane grupy na prawym skraju wykresu. Ścisłe powiązanie słów „character” i „novel” oraz wydzielenie osobnego klastra dla pojęcia „story” potwierdzają, że dyskusja o warstwie fabularnej tworzy odrębny, wewnętrznie spójny nurt. Z kolei odosobnienie słów „great” oraz „life” po lewej stronie drzewa sugeruje istnienie specyficznych nisz tematycznych (np. opinii wybitnie entuzjastycznych lub recenzji literatury faktu), których struktura leksykalna znacząco odbiega od standardowych ocen.
+
+### 6.5. Word Embedding (Word2Vec)
+
+W celu rozszerzenia analizy o zaawansowane techniki przetwarzania języka naturalnego, na oczyszczonym korpusie wytrenowano model Word2Vec. Zastosowanie tej metody pozwoliło na przetransformowanie słownictwa do postaci 50-wymiarowych wektorów gęstych, co umożliwia matematyczne uchwycenie relacji semantycznych między pojęciami. Dzięki takiej reprezentacji wektorowej algorytm jest w stanie precyzyjnie identyfikować słowa o najbardziej zbliżonym znaczeniu i kontekście, bazując wyłącznie na ich wzorcach współwystępowania w recenzjach.
+
+```{r word_embedding}
+library(word2vec) 
+
+# Złączenie pojedynczych tokenów z powrotem w czyste zdania (wymóg word2vec)
+text_for_w2v <- word_tokens %>%
+  group_by(id) %>%
+  summarise(text = paste(word, collapse = " ")) %>%
+  pull(text)
+
+# Trenowanie modelu Word2Vec (algorytm Skip-Gram) na korpusie
+set.seed(1234)
+model_w2v <- word2vec(x = text_for_w2v, type = "skip-gram", dim = 50, iter = 15)
+
+# Wyciągnięcie wektorów (Word Embeddings)
+embeddings <- as.matrix(model_w2v)
+
+# Wykorzystanie wektorów do znalezienia 5 najbliższych semantycznie słów 
+# dla kluczowych pojęć: "book" oraz "character"
+synonimy <- predict(model_w2v, c("book", "character"), type = "nearest", top_n = 5)
+
+# Prezentacja wyników
+synonimy
+```
+
+**Wnioski z modelowania wektorowego (Word2Vec):**
+
+Zastosowanie algorytmu Skip-Gram pozwoliło na skuteczne zmapowanie ukrytych relacji semantycznych w korpusie. Analiza wektorów gęstych (embeddings) dla dwóch wybranych pojęć doskonale obrazuje, jak model w sposób nienadzorowany „nauczył się” kontekstu poszczególnych słów:
+
+* **Pojęcie „book” (kontekst ogólno-użytkowy):** Słowo to, jako centralny punkt odniesienia całego zbioru, wykazuje ekstremalnie wysokie podobieństwo (powyżej 0.93) do uniwersalnych określeń opisujących interakcję z produktem i jego ocenę („read”, „think”, „good”). Oznacza to, że występuje ono w bardzo zróżnicowanym sąsiedztwie, stanowiąc językową kotwicę dla ogólnych czasowników i przymiotników wartościujących.
+* **Pojęcie „character” (kontekst strukturalny):** W tym przypadku algorytm rewelacyjnie wychwycił specyfikę dziedzinową ocenianych produktów. Najbliższe wektory to „plot”, „main” oraz „story” (podobieństwo 0.90–0.91). Model samoczynnie powiązał postać z fabułą oraz wychwycił najczęstsze konstrukcje gramatyczne (np. „main character”), grupując wokół siebie kluczowe elementy składowe narracji.
+
+Wykorzystanie takich osadzeń wektorowych to niezwykle potężne narzędzie w analityce e-commerce i NLP. Zamiast zliczać wystąpienia pojedynczych wyrazów, systemy mogą matematycznie zrozumieć, że dyskusja o „postaciach” jest semantycznie nierozerwalna z dyskusją o „fabule”, co stanowi idealny fundament pod budowę zaawansowanych silników rekomendacyjnych oraz zautomatyzowanej analizy cech produktów.
