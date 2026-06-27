@@ -8,20 +8,20 @@ words using a full text-mining pipeline.
 
 ## Overview
 
-The goal of the project was to turn unstructured review text into structured insight —
+The goal of the project was to turn unstructured review text into structured insight -
 identifying what readers care about, how language differs between positive and negative
 reviews, and which themes dominate the corpus.
 
 ## Methods
 
-- **Text preprocessing** — corpus cleaning, stopword removal, lemmatization, tokenization
-- **Frequency analysis** — most common words, sentiment-split frequencies, trends over time
-- **Sentiment analysis** — Bing and NRC lexicons; correlation between sentiment and star ratings
-- **TF-IDF & representations** — term weighting and binary document-term matrices
-- **Word associations & bigram networks** — mapping contextual relationships between words
-- **Topic modeling (LDA)** — unsupervised discovery of latent themes across reviews
-- **Hierarchical clustering** — grouping key terms by TF-IDF distance
-- **Word embeddings (Word2Vec, Skip-Gram)** — 50-dimensional dense vectors capturing
+- **Text preprocessing** - corpus cleaning, stopword removal, lemmatization, tokenization
+- **Frequency analysis** - most common words, sentiment-split frequencies, trends over time
+- **Sentiment analysis** - Bing and NRC lexicons; correlation between sentiment and star ratings
+- **TF-IDF & representations** - term weighting and binary document-term matrices
+- **Word associations & bigram networks** - mapping contextual relationships between words
+- **Topic modeling (LDA)** - unsupervised discovery of latent themes across reviews
+- **Hierarchical clustering** - grouping key terms by TF-IDF distance
+- **Word embeddings (Word2Vec, Skip-Gram)** - 50-dimensional dense vectors capturing
   semantic similarity between words
 
 ## Tech Stack
