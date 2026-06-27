@@ -30,7 +30,10 @@ R, tidytext, tm, topicmodels, word2vec, textstem, ggplot2, wordcloud, igraph
 
 ## Data
 
-Sample of 50,000 book reviews from the Amazon Books Reviews dataset.
+## Data
+
+[Amazon Books Reviews dataset](https://www.kaggle.com/datasets/mohamedbakhet/amazon-books-reviews) (Kaggle).
+The full dataset contains ~3 million reviews; this project uses a sample of the first 50,000 for analysis.
 
 ## Files
 
